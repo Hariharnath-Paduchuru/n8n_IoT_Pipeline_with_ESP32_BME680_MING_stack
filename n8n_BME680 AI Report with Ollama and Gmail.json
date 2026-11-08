@@ -1,0 +1,292 @@
+{
+  "name": "BME680 AI Report with Ollama and Gmail (IoT Frontier)",
+  "nodes": [
+    {
+      "parameters": {
+        "topics": "iotfrontier/bme680/telemetry",
+        "options": {
+          "jsonParseBody": true
+        }
+      },
+      "id": "00de9907-96f7-43aa-bc0b-a6b1c05547a4",
+      "name": "MQTT Trigger",
+      "type": "n8n-nodes-base.mqttTrigger",
+      "typeVersion": 1,
+      "position": [
+        48,
+        304
+      ],
+      "credentials": {
+        "mqtt": {
+          "id": "4xdWnDkvo1qMBLA4",
+          "name": "MQTT account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Prepare Line Protocol (n8n Code node, Run Once for Each Item)\nlet m = $json.message;\nif (typeof m === 'string') {\n  m = JSON.parse(m);\n}\n\nconst temperature = Number(m.temperature);\nconst humidity = Number(m.humidity);\nconst pressure = Number(m.pressure);\nconst gasKohm = Number(m.gas_kohm);\n\nif ([temperature, humidity, pressure, gasKohm].some(Number.isNaN)) {\n  throw new Error('Bad payload: ' + JSON.stringify(m));\n}\n\n// Tag values cannot contain spaces, commas or equals signs\nconst device = String(m.device || 'unknown').replace(/[ ,=]/g, '_');\n\nconst line = `bme680,device=${device} temperature=${temperature},humidity=${humidity},pressure=${pressure},gas_kohm=${gasKohm}`;\n\nreturn { json: { line } };\n"
+      },
+      "id": "6334266c-9be4-474d-9a82-c72cba497a42",
+      "name": "Prepare Line Protocol",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://us-east-1-1.aws.cloud2.influxdata.com/api/v2/write?org=org&bucket=bme680",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json.line }}",
+        "options": {}
+      },
+      "id": "7bad508a-e0b3-4467-bd08-1245b106026a",
+      "name": "Write to InfluxDB Cloud",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        496,
+        304
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "I3g3cdcQdkZzXr7o",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 0.5
+            }
+          ]
+        }
+      },
+      "id": "ac781f3b-5006-48e1-9fbd-d1601a216692",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        48,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://us-east-1-1.aws.cloud2.influxdata.com/api/v2/query?org=org",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/csv"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/vnd.flux",
+        "body": "from(bucket: \"bme680\")\n  |> range(start: -30m)\n  |> filter(fn: (r) => r._measurement == \"bme680\")\n  |> keep(columns: [\"_time\", \"_field\", \"_value\"])",
+        "options": {}
+      },
+      "id": "50b92299-7039-4b2b-9e28-1643bf838241",
+      "name": "Query Last Hour",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        272,
+        640
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "I3g3cdcQdkZzXr7o",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Report Facts (n8n Code node, Run Once for All Items)\n\n// ---- Edit the alert thresholds here ----\nconst T = {\n  humidityHigh: 70,    // %RH\n  humidityLow: 30,     // %RH\n  tempHigh: 32,        // C\n  pressureDrop: -2.0,  // hPa change over the hour\n  gasDropPct: 20       // % fall in gas resistance over the hour\n};\n\nconst isTest = $execution.mode === 'test';\nconst csv = String($input.first().json.data ?? '');\n\n// ---- Parse the annotated CSV from InfluxDB ----\nconst rows = [];\nlet header = null;\nfor (const raw of csv.split(/\\r?\\n/)) {\n  const line = raw.trim();\n  if (!line || line.startsWith('#')) continue;\n  const cols = line.split(',');\n  if (cols.includes('_value') && cols.includes('_field')) {\n    header = cols;\n    continue;\n  }\n  if (!header) continue;\n  const rec = {};\n  header.forEach((name, i) => { rec[name] = cols[i]; });\n  const value = Number(rec._value);\n  if (rec._field && !Number.isNaN(value)) {\n    rows.push({ field: rec._field, time: rec._time, value });\n  }\n}\n\n// ---- Summarise each field ----\nconst round = (x) => Math.round(x * 100) / 100;\nconst facts = {};\nfor (const field of ['temperature', 'humidity', 'pressure', 'gas_kohm']) {\n  const values = rows\n    .filter((r) => r.field === field)\n    .sort((a, b) => a.time.localeCompare(b.time))\n    .map((r) => r.value);\n  if (values.length === 0) continue;\n  const first = values[0];\n  const last = values[values.length - 1];\n  facts[field] = {\n    readings: values.length,\n    min: round(Math.min(...values)),\n    max: round(Math.max(...values)),\n    avg: round(values.reduce((a, b) => a + b, 0) / values.length),\n    first: round(first),\n    last: round(last),\n    change: round(last - first)\n  };\n}\n\n// ---- Apply the rules ----\nconst flags = [];\nif (Object.keys(facts).length === 0) flags.push('no_data');\nif (facts.humidity && facts.humidity.last > T.humidityHigh) flags.push('humidity_high');\nif (facts.humidity && facts.humidity.last < T.humidityLow) flags.push('humidity_low');\nif (facts.temperature && facts.temperature.last > T.tempHigh) flags.push('temperature_high');\nif (facts.pressure && facts.pressure.change <= T.pressureDrop) flags.push('pressure_dropping');\nif (facts.gas_kohm && facts.gas_kohm.first > 0) {\n  const dropPct = ((facts.gas_kohm.first - facts.gas_kohm.last) / facts.gas_kohm.first) * 100;\n  if (dropPct >= T.gasDropPct) flags.push('gas_resistance_falling');\n}\n\n// Scheduled runs only email when something is flagged. Test runs always email.\nif (flags.length === 0 && !isTest) {\n  return [];\n}\n\nconst subject = flags.length\n  ? 'BME680 alert: ' + flags.join(', ')\n  : 'BME680 routine check';\n\nconst prompt = [\n  'You are an assistant for an indoor environment sensor (BME680).',\n  'Write a plain-text email body of at most 4 short sentences, then one final line that starts with \"Action:\".',\n  'Use only the numbers given below. Never invent values. Do not state an air quality index.',\n  'Units: temperature in C, humidity in %RH, pressure in hPa, gas in kOhm.',\n  'Gas is a raw resistance. A falling trend can suggest worsening air quality, but it is only a relative signal.',\n  'If the flag no_data is present, say that no readings arrived in the last hour and suggest checking power, Wi-Fi and the HiveMQ connection.',\n  '',\n  'Flags: ' + (flags.length ? flags.join(', ') : 'none, routine check'),\n  'Last hour summary (JSON): ' + JSON.stringify(facts)\n].join('\\n');\n\nreturn [{ json: { prompt, subject, flags, facts } }];\n"
+      },
+      "id": "4d83d0d7-baa4-4e0b-b4de-b94fef3863ab",
+      "name": "Build Report Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}"
+      },
+      "id": "deef6173-9d5f-4391-ba89-c88e58297088",
+      "name": "Basic LLM Chain",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        720,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:8b",
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "1061122d-d59b-4cb9-9cf1-7ed9895fcfc4",
+      "name": "Ollama Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        792,
+        856
+      ],
+      "credentials": {
+        "ollamaApi": {
+          "id": "uuOOwrMMZxaNkIwy",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "email",
+        "toEmail": "email",
+        "subject": "={{ $('Build Report Facts').first().json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "6dd3b720-5e42-44a7-9361-7e4f30fc4140",
+      "name": "Send Gmail Report",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1072,
+        640
+      ],
+      "webhookId": "cfe679ee-1da9-44b4-9b1d-63ff779d7391",
+      "credentials": {
+        "smtp": {
+          "id": "ZoIibVsVDJ96fKwc",
+          "name": "SMTP account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "MQTT Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Line Protocol",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Line Protocol": {
+      "main": [
+        [
+          {
+            "node": "Write to InfluxDB Cloud",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Query Last Hour",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Last Hour": {
+      "main": [
+        [
+          {
+            "node": "Build Report Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report Facts": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Send Gmail Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "06239dd8-20be-4f51-bd71-8172e56ce323",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8e3d210ab5610372ba437a4c084518b2a695a680bd16a6405392a97ff1e7123e"
+  },
+  "nodeGroups": [],
+  "id": "OL2fC3hOFFPS34YS",
+  "tags": []
+}
